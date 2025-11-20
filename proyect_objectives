@@ -1,0 +1,192 @@
+Quiero que tengas en cuenta este contexto de proyecto durante toda la conversación:
+
+---
+
+Estoy trabajando en un proyecto experimental/TFG cuyo objetivo es **encajar un “Skyrim Essentials” en un disquete de 1,44 MB**. No quiero un clon gráfico 1:1, sino un juego minimalista que mantenga **todo el contenido de diálogos y estructura de quests** de Skyrim (idealmente las ~60.000 líneas de diálogo), usando compresión extrema y generación procedural para todo lo demás (mapa, texturas, modelos, música, voces).
+
+### 1. Estado actual del proyecto
+
+#### 1.1. Fuente de datos de diálogos
+
+* Parto de archivos como `SkyrimGOTY_Dialogue.txt` o CSV similares (incluyendo versiones parciales como las de GitHub/Thuum/UESP).
+* Cada línea tiene información tipo:
+
+  * `FormID`, `origin` (quest/escena), `expansion`, tipo (`SCEN`, `INFO`, `HELO`, etc.), índice y texto del diálogo.
+* He creado un **pipeline de limpieza**:
+
+  * Filtro solo líneas que empiezan por `FormID:`.
+  * Extraigo:
+
+    * `formId`
+    * `origin`
+    * `expansion`
+    * `part` (último número de la línea)
+    * `text` (todo lo que viene después de ese número)
+  * Elimino duplicados exactos (misma combinación de `formId, origin, expansion, part, text`).
+  * Genero un CSV limpio, por ejemplo:
+    `skyrim_dialogue_clean.csv` con cabecera tipo:
+    `id,formId,origin,expansion,part,text`.
+
+#### 1.2. Compresión semántica (tokens + Huffman)
+
+He construido un pipeline de compresión custom (inspirado en los scripts `Convert-SkyrimDialogue.ps1` y `Build-Dialog-Huffman.ps1`):
+
+1. **Detección de columna de texto**:
+
+   * Leo el CSV, detecto la columna de texto por la que más letras tiene en una muestra (en caso de duda, la última columna).
+
+2. **Tokenización básica de palabras**:
+
+   * Uso una expresión regular tipo:
+     `[A-Za-z0-9']+`
+   * Paso a minúsculas.
+   * Esto extrae palabras y formas con apóstrofo (`don't`, `he's`, etc.).
+
+3. **Morfología para reducir el vocabulario**:
+
+   * Aplico reglas para dividir palabras en base + sufijo, por ejemplo:
+
+     * `Xn't` → `X` + `n't`
+     * `X's`, `X're`, `X'll`, `X've`, `X'd`, `X't` → `X` + `'s` / `'re` / ... (si `X` tiene longitud mínima).
+     * `Xing` → `X` + `ing` (si `X` es suficientemente larga).
+   * Así reduzco el número de tokens diferentes y concentro frecuencia en sufijos comunes (negación, gerundio, contracciones inglesas, etc.).
+
+4. **Diccionario de tokens (palabras/morfemas)**:
+
+   * Mantengo un diccionario `token -> id` con `id` enteros consecutivos (`1..N`).
+   * Cada línea de diálogo se convierte en una lista de IDs.
+   * También guardo una gran lista global `tokenStream` con todos los IDs de todo el guion.
+
+5. **Huffman sobre IDs**:
+
+   * Cuento la frecuencia de cada `id` en `tokenStream`.
+   * Construyo un árbol de Huffman.
+   * Asigno códigos de bits más cortos a los tokens más frecuentes.
+   * Codifico `tokenStream` a un flujo de bits compactado, que escribo en `dialog_huffman.bin`.
+
+6. **Diccionario en texto y binario**:
+
+   * Diccionario de depuración:
+     `dict_full.txt` con líneas tipo:
+     `id;token`
+
+     * Si tengo macros de frases, las represento como:
+       `id;id1,id2,id3,...` (lista de IDs en vez de texto).
+   * Diccionario binario (en versiones más avanzadas):
+
+     * Encabezado + número de entradas.
+     * Por entrada:
+       `id`, tipo (palabra o macro), longitud y datos (UTF-8 o secuencia de IDs).
+
+7. **Deflate opcional (segunda fase)**:
+
+   * En algunos experimentos, concateno diccionario binario + stream Huffman y los paso por un compresor Deflate (zlib/DeflateStream) para exprimir un poco más (como hace ZIP/PNG/gzip).
+   * Esto produce un archivo tipo `dialogue_pack.deflate`, todavía más pequeño.
+
+Con una muestra parcial (unas 34.426 líneas que pesaban ~5 MB), hemos llegado a tamaños en el rango de **~600–700 KB** (diccionario + Huffman, o empaquetado final), es decir, cerca de **x6–x7 de compresión real**, que es una “locura” de buena en el contexto de Skyrim.
+
+### 2. Ideas adicionales de compresión y estructura
+
+* **Macros de frases / n-grams**:
+
+  * He experimentado con:
+
+    * macros de línea completa (líneas idénticas que se repiten muchas veces),
+    * macros de n-gram (subsecuencias de IDs repetidas con cierta longitud y frecuencia).
+  * Se crean entradas extra en el diccionario (ID de macro → secuencia de IDs), y el stream se reescribe sustituyendo secuencias por un solo ID de macro si la ganancia es positiva.
+  * Hay que tener cuidado de **no crear macros donde la concatenación de IDs normales ya es más eficiente** (p.ej. no merece la pena crear una macro para una frase muy corta si el aumento de vocabulario no compensa).
+
+* **Eliminación de duplicados en el CSV**:
+
+  * Antes de comprimir, filtro diálogos duplicados (mismas columnas y mismo texto).
+  * Eso ya recorta miles de líneas redundantes.
+
+* Hemos hablado también de:
+
+  * Posibles mejoras adicionales: Huffman + otro algoritmo (LZ, aritmético, etc.).
+  * Generación procedural de música a partir de partituras (notas + uno o pocos samples), en vez de audio crudo.
+  * Texturas y modelos generados por nodos/procedural, no guardados como assets pesados.
+  * Uso de TTS / sistema tipo Tomodachi Life: guardar texto y generar fonemas en runtime, sin audios pregrabados.
+
+### 3. Objetivo de arquitectura runtime
+
+Quiero separar claramente dos fases:
+
+1. **Offline (PC moderno / herramienta de build)**:
+
+   * Aplicar todo el pipeline caro:
+
+     * limpieza del CSV, deduplicación,
+     * tokenización + morfología,
+     * diccionario + macros,
+     * Huffman (y quizá Deflate),
+     * generación de binarios optimizados para el juego.
+   * Aquí puedo usar PowerShell, C, librerías de compresión, etc.
+
+2. **Runtime (el juego “Skyrim Essentials” en entorno muy limitado)**:
+
+   * Tener un **decoder pequeñito** escrito en C (o lenguaje similar), capaz de:
+
+     * cargar el diccionario binario,
+     * cargar el stream de IDs comprimidos (Huffman u otro),
+     * reconstruir las frases cuando se pidan,
+     * trabajar por `line_id` o por rangos.
+   * Cargar los datos comprimidos desde un disquete de 1.44 MB o simulado.
+   * Decidir una estrategia de carga:
+
+     * o descomprimir todo al inicio (si la RAM lo permite),
+     * o usar un sistema por bloques/zona/quest, con un índice mínimo (`quest -> rango de líneas` o `bloque -> offset/tamaño`).
+
+También hemos discutido que:
+
+* **Deflate es secuencial**: no permite acceso aleatorio a un diálogo sin descomprimir al menos el bloque donde está.
+* Para acceso eficiente a diálogos concretos, es mejor:
+
+  * usar Deflate solo como empaquetado en disco,
+  * y una vez en runtime, trabajar con:
+
+    * Huffman + diccionario,
+    * o incluso IDs ya decodificados a un buffer en RAM.
+
+### 4. Limitaciones y filosofía del proyecto
+
+* El límite duro de almacenamiento es el disquete: **1.44 MB**.
+* Quiero reservar espacio para:
+
+  * código del juego,
+  * sistema de generación procedural de mapa, texturas, modelos y música,
+  * y todo el sistema de diálogos (esto último es lo que estamos optimizando ahora).
+* Soy muy agresivo con la compresión, pero:
+
+  * Idealmente **no quiero perder líneas de diálogo**.
+  * Estoy dispuesto a:
+
+    * agrupar frases muy redundantes en variantes,
+    * sustituir frases triviales por otras equivalentes si ayudan a la compresión,
+    * pero el objetivo principal es conservar el contenido cuanto más intacto mejor.
+* Prefiero soluciones **algorítmicas y low-level** a “solo usa ZIP/7zip”.
+
+### 5. Qué espero de ti como modelo
+
+Cuando trabajemos sobre este proyecto, quiero que:
+
+1. **Mantengas siempre en mente**:
+
+   * el límite de 1.44 MB,
+   * la separación entre fase offline (donde podemos hacer lo que queramos) y runtime (donde el código y los datos deben ser mínimos).
+
+2. Me ayudes con:
+
+   * nuevas ideas de compresión sin pérdida aplicadas a diálogos (tokenización, gramáticas, frasarios, índices, etc.),
+   * diseño de formatos binarios compactos para diccionarios y streams,
+   * propuestas realistas de arquitectura runtime (por bloques, por zonas, por quests, índice de líneas…),
+   * traducción de scripts PowerShell a C u otros lenguajes de sistemas,
+   * análisis de trade-offs: cuándo conviene usar Deflate, cuándo no, cómo combinarlo con Huffman y diccionarios.
+
+3. A la hora de responder:
+
+   * Explícame las ideas de forma técnica pero clara, en español (Castellano).
+   * Da ejemplos concretos (estructuras, pseudocódigo, tamaños aproximados).
+   * Evita respuestas genéricas tipo “usa ZIP y ya”, y céntrate en cosas que pueda implementar o adaptar a este pipeline concreto.
+
+A partir de ahora, cuando te pregunte sobre este tema, asume todo este contexto sin que tenga que repetirlo y ayúdame a iterar sobre el diseño, la compresión y la arquitectura de “Skyrim Essentials en 1.44 MB”.
