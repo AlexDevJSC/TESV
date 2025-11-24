@@ -1,15 +1,15 @@
 /* build_dialog_huffman.c
  *
- * Builder de diccionario + Huffman + macros de trigramas + paquete Deflate
- * para los diálogos de Skyrim limpios en CSV:
+ * Builder de diccionario + morfología + Huffman + macros de n-gramas (3–4)
+ * + paquete Deflate para los diálogos de Skyrim limpios en CSV:
  *
  *   skyrim_dialogue_clean.csv
  *   (cabecera: id,formId,origin,expansion,part,text)
  *
  * Salidas:
- *   - dict_full.txt       (id;token o id;id1,id2,id3 para macros)
- *   - dict_full.bin       (binario compacto: solo longitud + texto)
- *   - dialog_huffman.bin  (HUF1 + tabla de longitudes + bitstream)
+ *   - dict_full.txt        (id;token o id;id1,id2,... para macros)
+ *   - dict_full.bin        (binario compacto: longitud + texto)
+ *   - dialog_huffman.bin   (HUF1 + tabla de longitudes + bitstream)
  *   - dialogue_pack.deflate (paquete final Deflate)
  *
  * Compilar (TDM-GCC + zlib):
@@ -116,18 +116,16 @@ static CsvRow parse_csv_line(const char *line) {
         char c = *p++;
         if (c == '"') {
             if (in_quotes && *p == '"') {
-                /* comilla escapada "" -> " */
                 if (fieldLen + 1 >= fieldCap) {
                     fieldCap *= 2;
                     field = (char *)xrealloc(field, fieldCap);
                 }
                 field[fieldLen++] = '"';
-                p++; /* saltar segunda comilla */
+                p++;
             } else {
                 in_quotes = !in_quotes;
             }
         } else if (c == ',' && !in_quotes) {
-            /* fin de campo */
             if (fieldLen + 1 >= fieldCap) {
                 fieldCap *= 2;
                 field = (char *)xrealloc(field, fieldCap);
@@ -197,7 +195,6 @@ typedef struct {
 } Dict;
 
 static unsigned hash_str(const char *s) {
-    /* FNV-1a 32-bit */
     unsigned h = 2166136261u;
     while (*s) {
         h ^= (unsigned char)*s++;
@@ -241,7 +238,6 @@ static int dict_get_or_add(Dict *d, const char *token) {
         n = n->next;
     }
 
-    /* nuevo token */
     int id = d->nextId++;
     TokenNode *nn = (TokenNode *)xmalloc(sizeof(TokenNode));
     nn->token = strdup(token);
@@ -253,6 +249,20 @@ static int dict_get_or_add(Dict *d, const char *token) {
     d->idToToken[id] = nn->token;
 
     return id;
+}
+
+static int dict_find(const Dict *d, const char *token) {
+    unsigned h = hash_str(token);
+    int idx = (int)(h % (unsigned)d->hashSize);
+
+    TokenNode *n = d->buckets[idx];
+    while (n) {
+        if (strcmp(n->token, token) == 0) {
+            return n->id;
+        }
+        n = n->next;
+    }
+    return 0;
 }
 
 static void dict_free(Dict *d) {
@@ -270,7 +280,6 @@ static void dict_free(Dict *d) {
         free(d->buckets);
     }
     if (d->idToToken) {
-        /* Los tokens ya se liberan en los buckets; aquí solo el array. */
         free(d->idToToken);
     }
 }
@@ -309,76 +318,14 @@ static void ivec_free(IntVec *v) {
 }
 
 /* ============================
- * Normalización de texto + tokenización
+ * Normalización de texto
  * ============================ */
 
-/* Sufijos de contracción tratadas como tokens propios */
-static const char * const CONTR_SUFFIXES[] = {
-    "'re","'ve","'ll","'d","'s","'m","'t","'em"
-};
-static const int CONTR_SUFFIX_COUNT = 8;
-
-/* Emite un token (string) al diccionario + stream */
-static void emit_token_str(Dict *dict, IntVec *stream, const char *s, int len) {
-    if (len <= 0) return;
-    char buf[256];
-    if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
-    memcpy(buf, s, (size_t)len);
-    buf[len] = '\0';
-    int id = dict_get_or_add(dict, buf);
-    ivec_push(stream, id);
-}
-
-/* Procesa una “palabra” con posibles contracciones tipo you're, it's, can't... */
-static void process_word_token(const char *word, int len, Dict *dict, IntVec *stream) {
-    if (len <= 0) return;
-
-    int aposIndex = -1;
-    for (int i = 1; i < len; ++i) {
-        if (word[i] == '\'') {
-            aposIndex = i;
-            break;
-        }
-    }
-
-    if (aposIndex > 0 && aposIndex < len - 1) {
-        const char *suffix = word + aposIndex;
-        int sLen = len - aposIndex;
-
-        for (int si = 0; si < CONTR_SUFFIX_COUNT; ++si) {
-            const char *suff = CONTR_SUFFIXES[si];
-            int suffLen = (int)strlen(suff);
-            if (sLen == suffLen && memcmp(suffix, suff, (size_t)sLen) == 0) {
-                int baseLen = aposIndex;
-                int baseOk = 1;
-                if (baseLen <= 0) baseOk = 0;
-                for (int j = 0; j < baseLen; ++j) {
-                    unsigned char c = (unsigned char)word[j];
-                    if (!isalnum(c)) {
-                        baseOk = 0;
-                        break;
-                    }
-                }
-                if (baseOk) {
-                    /* ej: "you're" -> "you" + "'re" */
-                    emit_token_str(dict, stream, word, baseLen);
-                    emit_token_str(dict, stream, suffix, sLen);
-                    return;
-                }
-            }
-        }
-    }
-
-    /* Si no hay contracción relevante, emitimos la palabra entera */
-    emit_token_str(dict, stream, word, len);
-}
-
-/* Corta colas tipo: "papa.  Disappointed" o "papa.   (inner monologue)" */
 static char *strip_trailing_stage_dir(const char *text) {
     size_t n = strlen(text);
     for (size_t i = 0; i < n; ++i) {
         char c = text[i];
-        if (c == '.' || c == '!' || c == '?' ) {
+        if (c == '.' || c == '!' || c == '?') {
             size_t j = i + 1;
             int spaceCount = 0;
             while (j < n && text[j] == ' ') {
@@ -388,7 +335,6 @@ static char *strip_trailing_stage_dir(const char *text) {
             if (spaceCount >= 2 && j < n) {
                 unsigned char next = (unsigned char)text[j];
                 if ((next >= 'A' && next <= 'Z') || next == '(') {
-                    /* Nos quedamos hasta el punto (o !, ?) inclusive */
                     size_t outLen = i + 1;
                     char *out = (char *)xmalloc(outLen + 1);
                     memcpy(out, text, outLen);
@@ -398,14 +344,12 @@ static char *strip_trailing_stage_dir(const char *text) {
             }
         }
     }
-    /* Sin cola tipo "Disappointed": devolvemos copia completa */
     size_t outLen = n;
     char *out = (char *)xmalloc(outLen + 1);
     memcpy(out, text, outLen + 1);
     return out;
 }
 
-/* Pasa a lowercase y elimina [texto] entre corchetes */
 static char *normalize_case_and_brackets(const char *text) {
     size_t n = strlen(text);
     char *out = (char *)xmalloc(n + 1);
@@ -422,9 +366,7 @@ static char *normalize_case_and_brackets(const char *text) {
             if (depth > 0) depth--;
             continue;
         }
-        if (depth > 0) {
-            continue; /* estamos dentro de [ ... ], se ignora */
-        }
+        if (depth > 0) continue;
         out[o++] = (char)tolower((unsigned char)c);
     }
 
@@ -432,7 +374,6 @@ static char *normalize_case_and_brackets(const char *text) {
     return out;
 }
 
-/* Normalización completa: cortar cola + corchetes + lowercase */
 static char *normalize_text(const char *text) {
     char *cut = strip_trailing_stage_dir(text);
     char *norm = normalize_case_and_brackets(cut);
@@ -440,8 +381,25 @@ static char *normalize_text(const char *text) {
     return norm;
 }
 
-/* Nueva tokenización: palabras + puntuación como tokens separados */
-static void tokenize_text(const char *text, Dict *dict, IntVec *stream) {
+/* ============================
+ * Emisión de tokens
+ * ============================ */
+
+static void emit_token_str(Dict *dict, IntVec *stream, const char *s, int len) {
+    if (len <= 0) return;
+    char buf[256];
+    if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
+    memcpy(buf, s, (size_t)len);
+    buf[len] = '\0';
+    int id = dict_get_or_add(dict, buf);
+    ivec_push(stream, id);
+}
+
+/* ============================
+ * PASS 1: tokenización básica
+ * ============================ */
+
+static void tokenize_text_pass1(const char *text, Dict *dict, IntVec *stream) {
     char *norm = normalize_text(text);
     size_t len = strlen(norm);
     size_t i = 0;
@@ -453,24 +411,22 @@ static void tokenize_text(const char *text, Dict *dict, IntVec *stream) {
 
         if (isspace(c)) {
             if (wlen > 0) {
-                process_word_token(wordBuf, wlen, dict, stream);
+                emit_token_str(dict, stream, wordBuf, wlen);
                 wlen = 0;
             }
             i++;
             continue;
         }
 
-        /* Puntuación como token propio */
         if (c == '.' || c == ',' || c == '!' || c == '?' ||
             c == ';' || c == ':' || c == '(' || c == ')') {
 
             if (wlen > 0) {
-                process_word_token(wordBuf, wlen, dict, stream);
+                emit_token_str(dict, stream, wordBuf, wlen);
                 wlen = 0;
             }
 
             if (c == '.') {
-                /* Rachas de puntos: "." ".." "..." => un solo token */
                 size_t start = i;
                 size_t j = i;
                 while (j < len && norm[j] == '.') {
@@ -486,7 +442,6 @@ static void tokenize_text(const char *text, Dict *dict, IntVec *stream) {
             continue;
         }
 
-        /* Caracter de palabra: letras, dígitos, guión bajo, apóstrofe */
         if (isalnum(c) || c == '\'' || c == '_') {
             if (wlen < (int)sizeof(wordBuf) - 1) {
                 wordBuf[wlen++] = (char)c;
@@ -494,7 +449,7 @@ static void tokenize_text(const char *text, Dict *dict, IntVec *stream) {
             i++;
         } else {
             if (wlen > 0) {
-                process_word_token(wordBuf, wlen, dict, stream);
+                emit_token_str(dict, stream, wordBuf, wlen);
                 wlen = 0;
             }
             i++;
@@ -502,10 +457,247 @@ static void tokenize_text(const char *text, Dict *dict, IntVec *stream) {
     }
 
     if (wlen > 0) {
-        process_word_token(wordBuf, wlen, dict, stream);
+        emit_token_str(dict, stream, wordBuf, wlen);
     }
 
     free(norm);
+}
+
+/* ============================
+ * PASS 2: morfología global
+ * ============================ */
+
+static const char * const CONTR_SUFFIXES[] = {
+    "'s","'re","'ve","'ll","'d","'m","'em"
+};
+static const int CONTR_SUFFIX_COUNT = 7;
+
+/* sufijos planos: se pegan directamente tras la base */
+static const char * const PLAIN_SUFFIXES[] = {
+    "ed","es","er","ly"
+};
+static const int PLAIN_SUFFIX_COUNT = 4;
+
+static void morph_split_token(const char *word,
+                              const Dict *baseDict,
+                              Dict *outDict,
+                              IntVec *outStream)
+{
+    int len = (int)strlen(word);
+    if (len <= 0) return;
+
+    char baseBuf[256];
+
+    /* 1) Caso especial: "n't" */
+    int ntPos = -1;
+    for (int i = 1; i + 2 < len; ++i) {
+        if (word[i] == 'n' && word[i+1] == '\'' && word[i+2] == 't') {
+            ntPos = i;
+            break;
+        }
+    }
+
+    if (ntPos > 0) {
+        int baseLen = ntPos;
+
+        if (baseLen > 0 && baseLen < (int)sizeof(baseBuf)) {
+            memcpy(baseBuf, word, (size_t)baseLen);
+            baseBuf[baseLen] = '\0';
+            int baseId = dict_find(baseDict, baseBuf);
+            if (baseId != 0) {
+                emit_token_str(outDict, outStream, baseBuf, baseLen);
+                emit_token_str(outDict, outStream, "n't", 3);
+                return;
+            }
+        }
+
+        if (baseLen > 0 && baseLen + 1 < (int)sizeof(baseBuf)) {
+            memcpy(baseBuf, word, (size_t)baseLen);
+            baseBuf[baseLen] = 'n';
+            baseBuf[baseLen + 1] = '\0';
+
+            int baseNId = dict_find(baseDict, baseBuf);
+            if (baseNId != 0) {
+                emit_token_str(outDict, outStream, baseBuf, baseLen + 1);
+                emit_token_str(outDict, outStream, "'t", 2);
+                return;
+            }
+        }
+    }
+
+    /* 2) Sufijos con apóstrofe */
+    int aposIndex = -1;
+    for (int i = 1; i < len - 1; ++i) {
+        if (word[i] == '\'') {
+            aposIndex = i;
+            break;
+        }
+    }
+
+    if (aposIndex > 0 && aposIndex < len - 1) {
+        const char *suffix = word + aposIndex;
+        int sLen = len - aposIndex;
+
+        int suffixMatched = 0;
+        for (int si = 0; si < CONTR_SUFFIX_COUNT; ++si) {
+            const char *suff = CONTR_SUFFIXES[si];
+            int suffLen = (int)strlen(suff);
+            if (sLen == suffLen && memcmp(suffix, suff, (size_t)sLen) == 0) {
+                suffixMatched = 1;
+                break;
+            }
+        }
+
+        if (suffixMatched) {
+            int baseLen = aposIndex;
+            int baseOk = 1;
+
+            if (baseLen <= 0) baseOk = 0;
+            for (int j = 0; j < baseLen && baseOk; ++j) {
+                unsigned char c = (unsigned char)word[j];
+                if (!isalnum(c)) {
+                    baseOk = 0;
+                }
+            }
+
+            if (baseOk) {
+                if (baseLen >= (int)sizeof(baseBuf)) baseLen = (int)sizeof(baseBuf) - 1;
+                memcpy(baseBuf, word, (size_t)baseLen);
+                baseBuf[baseLen] = '\0';
+
+                int baseId = dict_find(baseDict, baseBuf);
+                if (baseId != 0) {
+                    emit_token_str(outDict, outStream, baseBuf, baseLen);
+                    emit_token_str(outDict, outStream, suffix, sLen);
+                    return;
+                }
+            }
+        }
+    }
+
+    /* 3) Sufijo "ing" */
+    if (len > 3 &&
+        word[len-3] == 'i' &&
+        word[len-2] == 'n' &&
+        word[len-1] == 'g') {
+
+        int baseLen = len - 3;
+        if (baseLen > 0 && baseLen < (int)sizeof(baseBuf)) {
+            memcpy(baseBuf, word, (size_t)baseLen);
+            baseBuf[baseLen] = '\0';
+            int baseId = dict_find(baseDict, baseBuf);
+            if (baseId != 0) {
+                emit_token_str(outDict, outStream, baseBuf, baseLen);
+                emit_token_str(outDict, outStream, "ing", 3);
+                return;
+            }
+        }
+    }
+
+    /* 4) Sufijos planos: ed, es, er, ly */
+    for (int si = 0; si < PLAIN_SUFFIX_COUNT; ++si) {
+        const char *suf = PLAIN_SUFFIXES[si];
+        int sLen = (int)strlen(suf);
+
+        if (len > sLen + 2) { /* base >= 3 chars */
+            if (memcmp(word + (len - sLen), suf, (size_t)sLen) == 0) {
+                int baseLen = len - sLen;
+                if (baseLen >= (int)sizeof(baseBuf))
+                    baseLen = (int)sizeof(baseBuf) - 1;
+                memcpy(baseBuf, word, (size_t)baseLen);
+                baseBuf[baseLen] = '\0';
+
+                int baseId = dict_find(baseDict, baseBuf);
+                if (baseId != 0) {
+                    emit_token_str(outDict, outStream, baseBuf, baseLen);
+                    emit_token_str(outDict, outStream, suf, sLen);
+                    return;
+                }
+            }
+        }
+    }
+
+    /* 5) Sin split útil → palabra tal cual */
+    emit_token_str(outDict, outStream, word, len);
+}
+
+static void apply_morphology(const IntVec *inStream,
+                             const Dict *baseDict,
+                             Dict *outDict,
+                             IntVec *outStream)
+{
+    dict_init(outDict, DICT_HASH_SIZE);
+    ivec_init(outStream);
+
+    for (int i = 0; i < inStream->size; ++i) {
+        int id = inStream->data[i];
+        if (id < 1 || id >= baseDict->idCap) continue;
+        const char *tok = baseDict->idToToken[id];
+        if (!tok) tok = "";
+        morph_split_token(tok, baseDict, outDict, outStream);
+    }
+}
+
+/* ============================
+ * Reindexar tokens por longitud
+ * ============================ */
+
+typedef struct {
+    int   oldId;
+    char *token;
+    int   len;
+} TokenLenInfo;
+
+static int cmp_token_len(const void *a, const void *b) {
+    const TokenLenInfo *ta = (const TokenLenInfo *)a;
+    const TokenLenInfo *tb = (const TokenLenInfo *)b;
+    if (ta->len < tb->len) return -1;
+    if (ta->len > tb->len) return 1;
+    if (ta->oldId < tb->oldId) return -1;
+    if (ta->oldId > tb->oldId) return 1;
+    return 0;
+}
+
+static int reindex_tokens_by_length(Dict *dict, IntVec *stream) {
+    int count = dict->nextId - 1;
+    if (count <= 0) return 0;
+
+    TokenLenInfo *arr = (TokenLenInfo *)xmalloc((size_t)count * sizeof(TokenLenInfo));
+    for (int id = 1; id <= count; ++id) {
+        char *tok = dict->idToToken[id];
+        if (!tok) tok = "";
+        arr[id - 1].oldId = id;
+        arr[id - 1].token = tok;
+        arr[id - 1].len   = (int)strlen(tok);
+    }
+
+    qsort(arr, (size_t)count, sizeof(TokenLenInfo), cmp_token_len);
+
+    int   *oldToNew     = (int *)xcalloc((size_t)(count + 1), sizeof(int));
+    char **newIdToToken = (char **)xcalloc((size_t)(count + 1), sizeof(char *));
+
+    for (int i = 0; i < count; ++i) {
+        int newId = i + 1;
+        int oldId = arr[i].oldId;
+        oldToNew[oldId]      = newId;
+        newIdToToken[newId]  = arr[i].token;
+    }
+
+    for (int i = 0; i < stream->size; ++i) {
+        int oldId = stream->data[i];
+        if (oldId >= 1 && oldId <= count) {
+            stream->data[i] = oldToNew[oldId];
+        }
+    }
+
+    char **oldArr = dict->idToToken;
+    dict->idToToken = newIdToToken;
+    free(oldArr);
+
+    free(oldToNew);
+    free(arr);
+
+    return count;
 }
 
 /* ============================
@@ -513,7 +705,7 @@ static void tokenize_text(const char *text, Dict *dict, IntVec *stream) {
  * ============================ */
 
 typedef struct HuffNode {
-    int sym;            /* >0 simbolo, -1 interno */
+    int sym;
     uint32_t freq;
     struct HuffNode *left;
     struct HuffNode *right;
@@ -669,14 +861,14 @@ static void build_codes_rec(HuffNode *node,
 }
 
 /* ============================
- * BitWriter para el stream Huffman
+ * BitWriter
  * ============================ */
 
 typedef struct {
     uint8_t *data;
-    size_t size;   /* bytes llenos */
+    size_t size;
     size_t cap;
-    int bitPos;    /* 0..7 bit actual dentro del byte */
+    int bitPos;
 } BitWriter;
 
 static void bw_init(BitWriter *bw) {
@@ -739,13 +931,14 @@ static long file_size(const char *path) {
 }
 
 /* ============================
- * Macros de trigramas (3 tokens)
+ * Macros de n-gramas (3–4)
  * ============================ */
 
-#define MACRO_LEN              3
+#define NGRAM_MIN_LEN          3
+#define NGRAM_MAX_LEN          4
 #define MAX_MACROS             4096
-#define MIN_TRIGRAM_FREQ       8
-#define MIN_MACRO_GAIN_TOKENS  32   /* ganancia mínima en nº de IDs del stream */
+#define MIN_NGRAM_FREQ         8
+#define MIN_MACRO_GAIN_TOKENS  32
 
 typedef struct {
     uint64_t key;
@@ -794,22 +987,26 @@ static int macromap64_find(const MacroMapEntry64 *map, int count, uint64_t key) 
     return 0;
 }
 
-/* Construye macros de trigramas y re-encode el stream */
-static void build_trigram_macros(const IntVec *inStream,
-                                 int baseSymbolCount,
-                                 int **outMacroA,
-                                 int **outMacroB,
-                                 int **outMacroC,
-                                 int *outMacroCount,
-                                 IntVec *outStream)
+/* Construye macros de n-gramas (3 y 4) y reescribe el stream */
+static void build_ngram_macros(const IntVec *inStream,
+                               int baseSymbolCount,
+                               int **outMacroLen,
+                               int **outMacroA,
+                               int **outMacroB,
+                               int **outMacroC,
+                               int **outMacroD,
+                               int *outMacroCount,
+                               IntVec *outStream)
 {
-    *outMacroA = NULL;
-    *outMacroB = NULL;
-    *outMacroC = NULL;
+    *outMacroLen = NULL;
+    *outMacroA   = NULL;
+    *outMacroB   = NULL;
+    *outMacroC   = NULL;
+    *outMacroD   = NULL;
     *outMacroCount = 0;
     ivec_init(outStream);
 
-    if (inStream->size < MACRO_LEN || baseSymbolCount <= 0) {
+    if (inStream->size < NGRAM_MIN_LEN || baseSymbolCount <= 0) {
         for (int i = 0; i < inStream->size; ++i) {
             ivec_push(outStream, inStream->data[i]);
         }
@@ -818,8 +1015,7 @@ static void build_trigram_macros(const IntVec *inStream,
 
     if (baseSymbolCount > 65535) {
         fprintf(stderr,
-                "Aviso: demasiados tokens únicos (%d) para macros de 16 bits; "
-                "se desactivan macros de trigramas.\n",
+                "Aviso: demasiados tokens únicos (%d) para macros de n-gramas; se desactivan.\n",
                 baseSymbolCount);
         for (int i = 0; i < inStream->size; ++i) {
             ivec_push(outStream, inStream->data[i]);
@@ -827,23 +1023,48 @@ static void build_trigram_macros(const IntVec *inStream,
         return;
     }
 
-    int ngramTotal = inStream->size - (MACRO_LEN - 1);
-    uint64_t *keys = (uint64_t *)xmalloc((size_t)ngramTotal * sizeof(uint64_t));
+    int maxNgrams = inStream->size * (NGRAM_MAX_LEN - NGRAM_MIN_LEN + 1);
+    if (maxNgrams <= 0) {
+        for (int i = 0; i < inStream->size; ++i) {
+            ivec_push(outStream, inStream->data[i]);
+        }
+        return;
+    }
+
+    uint64_t *keys = (uint64_t *)xmalloc((size_t)maxNgrams * sizeof(uint64_t));
     int usedKeys = 0;
 
-    for (int i = 0; i < ngramTotal; ++i) {
-        int a = inStream->data[i];
-        int b = inStream->data[i + 1];
-        int c = inStream->data[i + 2];
-
-        if (a < 1 || a > baseSymbolCount ||
-            b < 1 || b > baseSymbolCount ||
-            c < 1 || c > baseSymbolCount) {
-            continue;
+    for (int i = 0; i < inStream->size; ++i) {
+        if (i + 2 < inStream->size) {
+            int a = inStream->data[i];
+            int b = inStream->data[i + 1];
+            int c = inStream->data[i + 2];
+            if (a >= 1 && a <= baseSymbolCount &&
+                b >= 1 && b <= baseSymbolCount &&
+                c >= 1 && c <= baseSymbolCount) {
+                uint64_t key = ((uint64_t)a << 48) |
+                               ((uint64_t)b << 32) |
+                               ((uint64_t)c << 16) |
+                               0u;
+                keys[usedKeys++] = key;
+            }
         }
-
-        uint64_t key = ((uint64_t)a << 32) | ((uint64_t)b << 16) | (uint64_t)c;
-        keys[usedKeys++] = key;
+        if (i + 3 < inStream->size) {
+            int a = inStream->data[i];
+            int b = inStream->data[i + 1];
+            int c = inStream->data[i + 2];
+            int d = inStream->data[i + 3];
+            if (a >= 1 && a <= baseSymbolCount &&
+                b >= 1 && b <= baseSymbolCount &&
+                c >= 1 && c <= baseSymbolCount &&
+                d >= 1 && d <= baseSymbolCount) {
+                uint64_t key = ((uint64_t)a << 48) |
+                               ((uint64_t)b << 32) |
+                               ((uint64_t)c << 16) |
+                               (uint64_t)d;
+                keys[usedKeys++] = key;
+            }
+        }
     }
 
     if (usedKeys == 0) {
@@ -879,54 +1100,68 @@ static void build_trigram_macros(const IntVec *inStream,
 
     int macroCap = MAX_MACROS;
     int macroCount = 0;
-    int *macroA = NULL;
-    int *macroB = NULL;
-    int *macroC = NULL;
+    int *macroLen = NULL;
+    int *macroA   = NULL;
+    int *macroB   = NULL;
+    int *macroC   = NULL;
+    int *macroD   = NULL;
 
     if (macroCap > 0) {
-        macroA = (int *)xmalloc((size_t)macroCap * sizeof(int));
-        macroB = (int *)xmalloc((size_t)macroCap * sizeof(int));
-        macroC = (int *)xmalloc((size_t)macroCap * sizeof(int));
+        macroLen = (int *)xmalloc((size_t)macroCap * sizeof(int));
+        macroA   = (int *)xmalloc((size_t)macroCap * sizeof(int));
+        macroB   = (int *)xmalloc((size_t)macroCap * sizeof(int));
+        macroC   = (int *)xmalloc((size_t)macroCap * sizeof(int));
+        macroD   = (int *)xmalloc((size_t)macroCap * sizeof(int));
 
         for (int i = 0; i < pfCount && macroCount < macroCap; ++i) {
             uint32_t f = pf[i].freq;
+            if (f < MIN_NGRAM_FREQ) break;
 
-            if (f < MIN_TRIGRAM_FREQ) break;
+            uint64_t key = pf[i].key;
+            int dId = (int)(key & 0xFFFFu);
+            int len = (dId == 0) ? 3 : 4;
 
-            /* Ganancia aproximada: (MACRO_LEN - 1) * f, para trigramas: 2*f */
-            uint32_t gainTokens = (MACRO_LEN - 1) * f;
+            uint32_t gainTokens = (uint32_t)((len - 1) * (uint64_t)f);
             if (gainTokens < MIN_MACRO_GAIN_TOKENS) {
                 continue;
             }
 
-            uint64_t key = pf[i].key;
-            int a = (int)((key >> 32) & 0xFFFFu);
-            int b = (int)((key >> 16) & 0xFFFFu);
-            int c = (int)(key & 0xFFFFu);
+            int a = (int)((key >> 48) & 0xFFFFu);
+            int b = (int)((key >> 32) & 0xFFFFu);
+            int c = (int)((key >> 16) & 0xFFFFu);
+            int d = dId;
 
-            macroA[macroCount] = a;
-            macroB[macroCount] = b;
-            macroC[macroCount] = c;
+            macroLen[macroCount] = len;
+            macroA[macroCount]   = a;
+            macroB[macroCount]   = b;
+            macroC[macroCount]   = c;
+            macroD[macroCount]   = (len == 4) ? d : 0;
             macroCount++;
         }
 
         if (macroCount == 0) {
+            free(macroLen);
             free(macroA);
             free(macroB);
             free(macroC);
-            macroA = macroB = macroC = NULL;
+            free(macroD);
+            macroLen = macroA = macroB = macroC = macroD = NULL;
         } else {
-            macroA = (int *)xrealloc(macroA, (size_t)macroCount * sizeof(int));
-            macroB = (int *)xrealloc(macroB, (size_t)macroCount * sizeof(int));
-            macroC = (int *)xrealloc(macroC, (size_t)macroCount * sizeof(int));
+            macroLen = (int *)xrealloc(macroLen, (size_t)macroCount * sizeof(int));
+            macroA   = (int *)xrealloc(macroA,   (size_t)macroCount * sizeof(int));
+            macroB   = (int *)xrealloc(macroB,   (size_t)macroCount * sizeof(int));
+            macroC   = (int *)xrealloc(macroC,   (size_t)macroCount * sizeof(int));
+            macroD   = (int *)xrealloc(macroD,   (size_t)macroCount * sizeof(int));
         }
     }
 
     free(pf);
 
-    *outMacroA = macroA;
-    *outMacroB = macroB;
-    *outMacroC = macroC;
+    *outMacroLen   = macroLen;
+    *outMacroA     = macroA;
+    *outMacroB     = macroB;
+    *outMacroC     = macroC;
+    *outMacroD     = macroD;
     *outMacroCount = macroCount;
 
     if (macroCount == 0) {
@@ -936,40 +1171,67 @@ static void build_trigram_macros(const IntVec *inStream,
         return;
     }
 
-    /* Mapa key -> macroId para reescritura rápida */
     MacroMapEntry64 *map = (MacroMapEntry64 *)xmalloc((size_t)macroCount * sizeof(MacroMapEntry64));
     for (int i = 0; i < macroCount; ++i) {
-        uint64_t key = ((uint64_t)macroA[i] << 32) |
-                       ((uint64_t)macroB[i] << 16) |
-                       (uint64_t)macroC[i];
+        uint64_t key = ((uint64_t)macroA[i] << 48) |
+                       ((uint64_t)macroB[i] << 32) |
+                       ((uint64_t)macroC[i] << 16) |
+                       (uint64_t)((macroLen[i] == 4) ? macroD[i] : 0);
         map[i].key = key;
         map[i].macroId = baseSymbolCount + i + 1;
     }
     qsort(map, (size_t)macroCount, sizeof(MacroMapEntry64), cmp_macromap64_key_asc);
 
-    /* Reescritura greedy del stream: si hay trigram-macro, sustituye (a,b,c) por macroId */
     int i = 0;
     while (i < inStream->size) {
-        if (i + (MACRO_LEN - 1) < inStream->size) {
+        int matched = 0;
+
+        if (i + 3 < inStream->size) {
+            int a = inStream->data[i];
+            int b = inStream->data[i + 1];
+            int c = inStream->data[i + 2];
+            int d = inStream->data[i + 3];
+            if (a >= 1 && a <= baseSymbolCount &&
+                b >= 1 && b <= baseSymbolCount &&
+                c >= 1 && c <= baseSymbolCount &&
+                d >= 1 && d <= baseSymbolCount) {
+                uint64_t key4 = ((uint64_t)a << 48) |
+                                ((uint64_t)b << 32) |
+                                ((uint64_t)c << 16) |
+                                (uint64_t)d;
+                int mid = macromap64_find(map, macroCount, key4);
+                if (mid != 0) {
+                    ivec_push(outStream, mid);
+                    i += 4;
+                    matched = 1;
+                }
+            }
+        }
+
+        if (!matched && i + 2 < inStream->size) {
             int a = inStream->data[i];
             int b = inStream->data[i + 1];
             int c = inStream->data[i + 2];
             if (a >= 1 && a <= baseSymbolCount &&
                 b >= 1 && b <= baseSymbolCount &&
                 c >= 1 && c <= baseSymbolCount) {
-                uint64_t key = ((uint64_t)a << 32) |
-                               ((uint64_t)b << 16) |
-                               (uint64_t)c;
-                int mid = macromap64_find(map, macroCount, key);
+                uint64_t key3 = ((uint64_t)a << 48) |
+                                ((uint64_t)b << 32) |
+                                ((uint64_t)c << 16) |
+                                0u;
+                int mid = macromap64_find(map, macroCount, key3);
                 if (mid != 0) {
                     ivec_push(outStream, mid);
-                    i += MACRO_LEN;
-                    continue;
+                    i += 3;
+                    matched = 1;
                 }
             }
         }
-        ivec_push(outStream, inStream->data[i]);
-        i++;
+
+        if (!matched) {
+            ivec_push(outStream, inStream->data[i]);
+            i++;
+        }
     }
 
     free(map);
@@ -993,7 +1255,6 @@ int main(void) {
 
     printf("Leyendo CSV limpio: %s\n", csvPath);
 
-    /* Saltar cabecera */
     char *line = read_line(csv);
     if (!line) {
         fclose(csv);
@@ -1001,11 +1262,10 @@ int main(void) {
     }
     free(line);
 
-    Dict dict;
-    dict_init(&dict, DICT_HASH_SIZE);
-
-    IntVec stream;
-    ivec_init(&stream);
+    Dict dictPass1;
+    dict_init(&dictPass1, DICT_HASH_SIZE);
+    IntVec streamPass1;
+    ivec_init(&streamPass1);
 
     size_t totalLines = 0;
 
@@ -1018,10 +1278,9 @@ int main(void) {
         CsvRow row = parse_csv_line(line);
         free(line);
 
-        /* Esperamos al menos 6 columnas: id,formId,origin,expansion,part,text */
         if (row.count >= 6) {
             const char *text = row.cols[5];
-            tokenize_text(text, &dict, &stream);
+            tokenize_text_pass1(text, &dictPass1, &streamPass1);
         }
 
         totalLines++;
@@ -1031,30 +1290,43 @@ int main(void) {
 
         free_csv_row(&row);
     }
-
     fclose(csv);
 
-    size_t totalTokensInitial = (size_t)stream.size;
-    int baseSymbolCount = dict.nextId - 1;
-    if (baseSymbolCount <= 0) {
-        die("No se generaron tokens; ¿CSV vacío?");
-    }
+    size_t totalTokensPass1 = (size_t)streamPass1.size;
+    int baseTokensPass1 = dictPass1.nextId - 1;
 
-    printf("Líneas totales          : %zu\n", totalLines);
-    printf("Tokens totales iniciales: %zu\n", totalTokensInitial);
-    printf("Tokens únicos (base)    : %d\n", baseSymbolCount);
+    printf("PASS1 - líneas totales          : %zu\n", totalLines);
+    printf("PASS1 - tokens totales          : %zu\n", totalTokensPass1);
+    printf("PASS1 - tokens únicos (base)    : %d\n", baseTokensPass1);
 
-    /* ==============================
-     * Macros de trigramas
-     * ============================== */
+    Dict dict;
+    IntVec stream;
+    apply_morphology(&streamPass1, &dictPass1, &dict, &stream);
 
-    int *macroA = NULL;
-    int *macroB = NULL;
-    int *macroC = NULL;
+    ivec_free(&streamPass1);
+    dict_free(&dictPass1);
+
+    size_t totalTokensMorph = (size_t)stream.size;
+    int tokensAfterMorph = dict.nextId - 1;
+
+    printf("PASS2 (morfología) - tokens totales: %zu\n", totalTokensMorph);
+    printf("PASS2 (morfología) - tokens únicos : %d\n", tokensAfterMorph);
+
+    int baseSymbolCount = reindex_tokens_by_length(&dict, &stream);
+
+    printf("Tras reindexado por longitud - tokens únicos: %d\n", baseSymbolCount);
+
+    int *macroLen = NULL;
+    int *macroA   = NULL;
+    int *macroB   = NULL;
+    int *macroC   = NULL;
+    int *macroD   = NULL;
     int macroCount = 0;
     IntVec stream2;
-    build_trigram_macros(&stream, baseSymbolCount,
-                         &macroA, &macroB, &macroC, &macroCount, &stream2);
+
+    build_ngram_macros(&stream, baseSymbolCount,
+                       &macroLen, &macroA, &macroB, &macroC, &macroD,
+                       &macroCount, &stream2);
 
     ivec_free(&stream);
     stream = stream2;
@@ -1062,48 +1334,32 @@ int main(void) {
     int symbolCountTotal = baseSymbolCount + macroCount;
     size_t totalTokensFinal = (size_t)stream.size;
 
-    printf("Macros de trigramas usadas: %d\n", macroCount);
-    printf("Tokens tras macros         : %zu\n", totalTokensFinal);
-    printf("Símbolos totales           : %d\n", symbolCountTotal);
-
-    /* ==============================
-     * Escribir dict_full.txt (mínimo)
-     * ============================== */
+    printf("PASS3 (n-gramas) - macros usados   : %d\n", macroCount);
+    printf("PASS3 (n-gramas) - tokens finales  : %zu\n", totalTokensFinal);
+    printf("PASS3 (n-gramas) - símbolos totales: %d\n", symbolCountTotal);
 
     FILE *dictTxt = fopen(dictTxtPath, "wb");
     if (!dictTxt) {
         die("No se puede crear dict_full.txt");
     }
 
-    /* Tokens base */
     for (int id = 1; id <= baseSymbolCount; ++id) {
         const char *token = dict.idToToken[id];
         if (!token) token = "";
         fprintf(dictTxt, "%d;%s\n", id, token);
     }
 
-    /* Macros como texto "id1,id2,id3" */
     for (int m = 0; m < macroCount; ++m) {
         int macroId = baseSymbolCount + m + 1;
-        int a = macroA[m];
-        int b = macroB[m];
-        int c = macroC[m];
-        fprintf(dictTxt, "%d;%d,%d,%d\n", macroId, a, b, c);
+        fprintf(dictTxt, "%d;%d,%d,%d", macroId, macroA[m], macroB[m], macroC[m]);
+        if (macroLen[m] == 4) {
+            fprintf(dictTxt, ",%d", macroD[m]);
+        }
+        fprintf(dictTxt, "\n");
     }
 
     fclose(dictTxt);
     printf("Escrito %s\n", dictTxtPath);
-
-    /* ==============================
-     * Diccionario binario dict_full.bin (compacto)
-     *
-     * Formato:
-     *   - 'D','L','G','1'
-     *   - uint32_t entryCount
-     *   - para id=1..entryCount:
-     *       uint16_t lenBytes
-     *       bytes UTF-8 del token
-     * ============================== */
 
     FILE *dictBin = fopen(dictBinPath, "wb");
     if (!dictBin) {
@@ -1118,30 +1374,27 @@ int main(void) {
     uint32_t entryCount = (uint32_t)symbolCountTotal;
     fwrite(&entryCount, sizeof(uint32_t), 1, dictBin);
 
-    /* Tokens base */
     for (int id = 1; id <= baseSymbolCount; ++id) {
         const char *token = dict.idToToken[id];
         if (!token) token = "";
         size_t tlen = strlen(token);
-        if (tlen > 65535) {
-            die("Token demasiado largo (>65535 bytes)");
-        }
+        if (tlen > 65535) die("Token demasiado largo (>65535 bytes)");
         uint16_t len16 = (uint16_t)tlen;
         fwrite(&len16, sizeof(uint16_t), 1, dictBin);
         fwrite(token, 1, tlen, dictBin);
     }
 
-    /* Macros: texto "id1,id2,id3" */
     for (int m = 0; m < macroCount; ++m) {
-        char buf[96];
-        int a = macroA[m];
-        int b = macroB[m];
-        int c = macroC[m];
-        snprintf(buf, sizeof(buf), "%d,%d,%d", a, b, c);
-        size_t tlen = strlen(buf);
-        if (tlen > 65535) {
-            die("Token de macro demasiado largo (>65535 bytes)");
+        char buf[128];
+        if (macroLen[m] == 3) {
+            snprintf(buf, sizeof(buf), "%d,%d,%d",
+                     macroA[m], macroB[m], macroC[m]);
+        } else {
+            snprintf(buf, sizeof(buf), "%d,%d,%d,%d",
+                     macroA[m], macroB[m], macroC[m], macroD[m]);
         }
+        size_t tlen = strlen(buf);
+        if (tlen > 65535) die("Token de macro demasiado largo (>65535 bytes)");
         uint16_t len16 = (uint16_t)tlen;
         fwrite(&len16, sizeof(uint16_t), 1, dictBin);
         fwrite(buf, 1, tlen, dictBin);
@@ -1149,10 +1402,6 @@ int main(void) {
 
     fclose(dictBin);
     printf("Escrito %s\n", dictBinPath);
-
-    /* ==============================
-     * Huffman sobre IDs (tokens + macros)
-     * ============================== */
 
     uint32_t *freq = (uint32_t *)xcalloc((size_t)(symbolCountTotal + 1),
                                          sizeof(uint32_t));
@@ -1182,16 +1431,10 @@ int main(void) {
     for (int i2 = 0; i2 < stream.size; ++i2) {
         int id = stream.data[i2];
         const char *code = codes[id];
-        if (!code) {
-            die("Código Huffman nulo para un ID.");
-        }
+        if (!code) die("Código Huffman nulo para un ID.");
         bw_put_code(&bw, code);
     }
     bw_flush(&bw);
-
-    /* ==============================
-     * Escribir dialog_huffman.bin
-     * ============================== */
 
     FILE *huffBin = fopen(huffBinPath, "wb");
     if (!huffBin) {
@@ -1217,10 +1460,6 @@ int main(void) {
 
     fclose(huffBin);
     printf("Escrito %s\n", huffBinPath);
-
-    /* ==============================
-     * Paquete final Deflate
-     * ============================== */
 
     long origSize = file_size(csvPath);
     long dictSize = file_size(dictBinPath);
@@ -1274,21 +1513,33 @@ int main(void) {
     fclose(fPack);
 
     printf("\n--- Estadísticas ---\n");
-    printf("Tamaño CSV original     : %ld bytes\n", origSize);
-    printf("Tamaño dict_full.bin    : %ld bytes\n", dictSize);
-    printf("Tamaño dialog_huffman   : %ld bytes\n", huffSize);
-    printf("Tamaño paquete raw      : %zu bytes\n", rawPackSize);
-    printf("Tamaño Deflate final    : %lu bytes\n", (unsigned long)destLen);
+    printf("Tamaño CSV original      : %ld bytes\n", origSize);
+    printf("Tamaño dict_full.bin     : %ld bytes\n", dictSize);
+    printf("Tamaño dialog_huffman    : %ld bytes\n", huffSize);
+    printf("Tamaño paquete sin compr.: %zu bytes\n", rawPackSize);
+    printf("Tamaño Deflate final     : %lu bytes\n", (unsigned long)destLen);
 
     if (origSize > 0) {
+        long diffDict = origSize - dictSize;
+        long diffHuff = origSize - huffSize;
+        long diffPack = origSize - (long)destLen;
+
+        double pctDict = 100.0 * (double)diffDict / (double)origSize;
+        double pctHuff = 100.0 * (double)diffHuff / (double)origSize;
+        double pctPack = 100.0 * (double)diffPack / (double)origSize;
+
+        printf("\nAhorro respecto a CSV original:\n");
+        printf(" dict_full.bin     : %+ld bytes (%.2f %%)\n", diffDict, pctDict);
+        printf(" dialog_huffman    : %+ld bytes (%.2f %%)\n", diffHuff, pctHuff);
+        printf(" dialogue_pack.defl: %+ld bytes (%.2f %%)\n", diffPack, pctPack);
+
         double ratioDictHuff = (double)origSize /
                                (double)(dictSize + huffSize);
         double ratioPack = (double)origSize / (double)destLen;
-        printf("Compresión dict+Huffman : x%.2f\n", ratioDictHuff);
-        printf("Compresión total        : x%.2f\n", ratioPack);
+        printf("\nCompresión dict+Huffman : x%.2f\n", ratioDictHuff);
+        printf("Compresión total (pack) : x%.2f\n", ratioPack);
     }
 
-    /* Limpieza básica */
     free(rawPack);
     free(comp);
     free(freq);
@@ -1301,9 +1552,14 @@ int main(void) {
     ivec_free(&stream);
     dict_free(&dict);
     free(bw.data);
+    free(macroLen);
     free(macroA);
     free(macroB);
     free(macroC);
+    free(macroD);
+
+    printf("\nPulsa ENTER para salir...");
+    getchar();
 
     return 0;
 }
