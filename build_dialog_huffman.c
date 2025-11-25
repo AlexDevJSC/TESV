@@ -23,7 +23,9 @@
 #include <stdbool.h>
 #include <ctype.h>
 
+#include <zlib.h>
 #include "zopfli-master/src/zopfli/zopfli.h"
+
 
 /* ============================
  * Utilidades de memoria
@@ -575,46 +577,52 @@ static void morph_split_token(const char *word,
         }
     }
 
-    /* 3) Sufijo "ing" (simple) */
+   /* 3) Sufijo "ing" con regla de puente tipo "run + ning" (Modo 1, opción A) */
     if (len > 3 &&
         word[len-3] == 'i' &&
         word[len-2] == 'n' &&
         word[len-1] == 'g') {
 
         int baseLen = len - 3;
+
+        /* 3.a) Intento directo: <base> + "ing" si la base ya existe */
         if (baseLen > 0 && baseLen < (int)sizeof(baseBuf)) {
             memcpy(baseBuf, word, (size_t)baseLen);
             baseBuf[baseLen] = '\0';
+
             int baseId = dict_find(baseDict, baseBuf);
             if (baseId != 0) {
+                /* ejemplo: "ringing" -> "ring" + "ing" */
                 emit_token_str(outDict, outStream, baseBuf, baseLen);
                 emit_token_str(outDict, outStream, "ing", 3);
                 return;
             }
         }
-    }
 
-    /* 4) Sufijos planos: ed, es, er, ly */
-    for (int si = 0; si < PLAIN_SUFFIX_COUNT; ++si) {
-        const char *suf = PLAIN_SUFFIXES[si];
-        int sLen = (int)strlen(suf);
+        /* 3.b) Regla de puente: letra duplicada antes de "ing"
+           running  -> run + ning
+           sitting  -> sit + ting
+           jogging  -> jog + ging
+         */
+        if (baseLen >= 2 &&
+            baseLen < (int)sizeof(baseBuf) &&
+            word[baseLen - 1] == word[baseLen - 2]) {
 
-        if (len > sLen + 2) { /* base >= 3 chars */
-            if (memcmp(word + (len - sLen), suf, (size_t)sLen) == 0) {
-                int baseLen = len - sLen;
-                if (baseLen >= (int)sizeof(baseBuf))
-                    baseLen = (int)sizeof(baseBuf) - 1;
-                memcpy(baseBuf, word, (size_t)baseLen);
-                baseBuf[baseLen] = '\0';
+            int prefixLen = baseLen - 1; /* quitamos una de las letras duplicadas */
+            memcpy(baseBuf, word, (size_t)prefixLen);
+            baseBuf[prefixLen] = '\0';
 
-                int baseId = dict_find(baseDict, baseBuf);
-                if (baseId != 0) {
-                    emit_token_str(outDict, outStream, baseBuf, baseLen);
-                    emit_token_str(outDict, outStream, suf, sLen);
+            int baseId2 = dict_find(baseDict, baseBuf);
+            if (baseId2 != 0) {
+                int suf2Len = len - prefixLen; /* p.ej. "ning", "ting", "ging" */
+                if (suf2Len > 0) {
+                    emit_token_str(outDict, outStream, baseBuf, prefixLen);
+                    emit_token_str(outDict, outStream, word + prefixLen, suf2Len);
                     return;
                 }
             }
         }
+        /* Si no se cumple nada, seguimos con el siguiente bloque de sufijos. */
     }
 
     /* 5) Regla extra: prefijo + texto intermedio + sufijo ("ing" o planos),
@@ -664,6 +672,24 @@ static void morph_split_token(const char *word,
     /* 6) Sin split útil → palabra tal cual */
     emit_token_str(outDict, outStream, word, len);
 }
+
+static void apply_morphology(const IntVec *inStream,
+                             const Dict *baseDict,
+                             Dict *outDict,
+                             IntVec *outStream)
+{
+    dict_init(outDict, DICT_HASH_SIZE);
+    ivec_init(outStream);
+
+    for (int i = 0; i < inStream->size; ++i) {
+        int id = inStream->data[i];
+        if (id < 1 || id >= baseDict->idCap) continue;
+        const char *tok = baseDict->idToToken[id];
+        if (!tok) tok = "";
+        morph_split_token(tok, baseDict, outDict, outStream);
+    }
+}
+
 
 /* ============================
  * Reindexar tokens por longitud
@@ -964,7 +990,7 @@ static long file_size(const char *path) {
 #define NGRAM_MIN_LEN          3
 #define NGRAM_MAX_LEN          4
 #define MAX_MACROS             4096
-#define MIN_NGRAM_FREQ         8
+#define MIN_NGRAM_FREQ         12
 #define MIN_MACRO_GAIN_TOKENS  64
 
 typedef struct {
@@ -1597,4 +1623,3 @@ int main(void) {
 
     return 0;
 }
-
