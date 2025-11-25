@@ -23,7 +23,7 @@
 #include <stdbool.h>
 #include <ctype.h>
 
-#include <zlib.h>
+#include "zopfli-master/src/zopfli/zopfli.h"
 
 /* ============================
  * Utilidades de memoria
@@ -575,7 +575,7 @@ static void morph_split_token(const char *word,
         }
     }
 
-    /* 3) Sufijo "ing" */
+    /* 3) Sufijo "ing" (simple) */
     if (len > 3 &&
         word[len-3] == 'i' &&
         word[len-2] == 'n' &&
@@ -617,25 +617,52 @@ static void morph_split_token(const char *word,
         }
     }
 
-    /* 5) Sin split útil → palabra tal cual */
-    emit_token_str(outDict, outStream, word, len);
-}
+    /* 5) Regla extra: prefijo + texto intermedio + sufijo ("ing" o planos),
+           modo 1 / opción A para casos como "running" -> "run" + "ning" */
+    {
+        const char * const SUF_LIST[] = { "ing", "ed", "es", "er", "ly" };
+        const int SUF_COUNT = (int)(sizeof(SUF_LIST) / sizeof(SUF_LIST[0]));
+        char sufBuf[256];
 
-static void apply_morphology(const IntVec *inStream,
-                             const Dict *baseDict,
-                             Dict *outDict,
-                             IntVec *outStream)
-{
-    dict_init(outDict, DICT_HASH_SIZE);
-    ivec_init(outStream);
+        for (int si = 0; si < SUF_COUNT; ++si) {
+            const char *suf = SUF_LIST[si];
+            int sLen = (int)strlen(suf);
 
-    for (int i = 0; i < inStream->size; ++i) {
-        int id = inStream->data[i];
-        if (id < 1 || id >= baseDict->idCap) continue;
-        const char *tok = baseDict->idToToken[id];
-        if (!tok) tok = "";
-        morph_split_token(tok, baseDict, outDict, outStream);
+            /* base >= 3 y al menos 1 letra entre base y sufijo */
+            if (len <= sLen + 3) continue;
+
+            /* ¿termina la palabra con este sufijo? */
+            if (memcmp(word + (len - sLen), suf, (size_t)sLen) != 0) continue;
+
+            int maxBridge = 2;      /* como mucho 2 letras de "puente" */
+            int minBaseLen = 3;
+
+            for (int bridgeLen = 1; bridgeLen <= maxBridge; ++bridgeLen) {
+                int baseLen = len - sLen - bridgeLen;
+                if (baseLen < minBaseLen) break;
+
+                if (baseLen >= (int)sizeof(baseBuf)) continue;
+                memcpy(baseBuf, word, (size_t)baseLen);
+                baseBuf[baseLen] = '\0';
+
+                int baseId = dict_find(baseDict, baseBuf);
+                if (baseId == 0) continue;
+
+                /* Nuevo sufijo = texto intermedio + sufijo normal. p.ej. "n" + "ing" -> "ning" */
+                int newSufLen = bridgeLen + sLen;
+                if (newSufLen >= (int)sizeof(sufBuf)) continue;
+                memcpy(sufBuf, word + baseLen, (size_t)newSufLen);
+                sufBuf[newSufLen] = '\0';
+
+                emit_token_str(outDict, outStream, baseBuf, baseLen);
+                emit_token_str(outDict, outStream, sufBuf, newSufLen);
+                return;
+            }
+        }
     }
+
+    /* 6) Sin split útil → palabra tal cual */
+    emit_token_str(outDict, outStream, word, len);
 }
 
 /* ============================
@@ -938,7 +965,7 @@ static long file_size(const char *path) {
 #define NGRAM_MAX_LEN          4
 #define MAX_MACROS             4096
 #define MIN_NGRAM_FREQ         8
-#define MIN_MACRO_GAIN_TOKENS  32
+#define MIN_MACRO_GAIN_TOKENS  64
 
 typedef struct {
     uint64_t key;
@@ -1493,14 +1520,21 @@ int main(void) {
     }
     fclose(fHuff);
 
-    uLong srcLen = (uLong)rawPackSize;
-    uLongf destLen = compressBound(srcLen);
-    uint8_t *comp = (uint8_t *)xmalloc(destLen);
+        /* --- Compresión final con Zopfli (formato zlib) --- */
+    unsigned char *comp = NULL;
+    size_t destLen = 0;
 
-    int zres = compress2(comp, &destLen, rawPack, srcLen, Z_BEST_COMPRESSION);
-    if (zres != Z_OK) {
-        die("compress2() falló al generar el paquete Deflate");
-    }
+    ZopfliOptions zopts;
+    ZopfliInitOptions(&zopts);
+    /* Puedes subir numiterations si quieres aún más compresión a costa de tiempo */
+    zopts.numiterations = 15;
+
+    ZopfliCompress(&zopts,
+                   ZOPFLI_FORMAT_ZLIB,
+                   (const unsigned char *)rawPack,
+                   rawPackSize,
+                   &comp,
+                   &destLen);
 
     FILE *fPack = fopen(packPath, "wb");
     if (!fPack) {
@@ -1563,3 +1597,4 @@ int main(void) {
 
     return 0;
 }
+
