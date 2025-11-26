@@ -376,11 +376,57 @@ static char *normalize_case_and_brackets(const char *text) {
     return out;
 }
 
-static char *normalize_text(const char *text) {
-    char *cut = strip_trailing_stage_dir(text);
-    char *norm = normalize_case_and_brackets(cut);
-    free(cut);
-    return norm;
+/* ============================
+ * Filtro de líneas redundantes
+ * ============================ */
+
+/* Normalizado -> detecta onomatopeyas cortas tipo "uh", "hmm", "ugh"... */
+static int is_onomatopoeia_norm(const char *norm) {
+    char tmp[32];
+    int n = 0;
+    for (const char *p = norm; *p && n < (int)sizeof(tmp) - 1; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (isspace(c)) continue;
+        if (c == '.' || c == '!' || c == '?' || c == ',') continue;
+        tmp[n++] = (char)c;
+    }
+    tmp[n] = '\0';
+
+    if (n == 0) return 1; /* vacío tras limpiar ⇒ nada interesante */
+
+    static const char * const ONOMA[] = {
+        "ah","ahh","ahhh",
+        "oh","ooh",
+        "uh","uhh","uhhh",
+        "hmm","hmmm",
+        "ugh","grr","huh"
+    };
+    int count = (int)(sizeof(ONOMA) / sizeof(ONOMA[0]));
+    for (int i = 0; i < count; ++i) {
+        if (strcmp(tmp, ONOMA[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Devuelve 1 si la línea normalizada es prescindible
+   (sólo puntuación / espacios / onomatopeya mínima). */
+static int should_skip_line_norm(const char *norm) {
+    int has_alnum = 0;
+
+    for (const char *p = norm; *p; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (isalnum(c)) {
+            has_alnum = 1;
+            break;
+        }
+    }
+
+    /* Sin letras ni dígitos: sólo ruido de puntuación */
+    if (!has_alnum) return 1;
+
+    if (is_onomatopoeia_norm(norm)) return 1;
+
+    return 0;
 }
 
 /* ============================
@@ -389,6 +435,8 @@ static char *normalize_text(const char *text) {
 
 static void emit_token_str(Dict *dict, IntVec *stream, const char *s, int len) {
     if (len <= 0) return;
+    if (!token_should_be_kept(s, len)) return;
+
     char buf[256];
     if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
     memcpy(buf, s, (size_t)len);
@@ -398,11 +446,51 @@ static void emit_token_str(Dict *dict, IntVec *stream, const char *s, int len) {
 }
 
 /* ============================
+ * Filtros de tokens
+ * ============================ */
+
+/* 1 si todos los caracteres son dígitos 0–9 */
+static int token_all_digits(const char *s, int len) {
+    if (len <= 0) return 0;
+    for (int i = 0; i < len; ++i) {
+        if (!isdigit((unsigned char)s[i])) return 0;
+    }
+    return 1;
+}
+
+/* Decide si merece la pena guardar este token en el diccionario. */
+static int token_should_be_kept(const char *s, int len) {
+    if (len <= 0) return 0;
+
+    /* Números muy cortos (1–2 dígitos) → fuera. */
+    if (token_all_digits(s, len) && len < 3) {
+        return 0;
+    }
+
+    /* Letras sueltas: sólo conservamos "a" e "i" como palabras completas. */
+    if (len == 1 && isalpha((unsigned char)s[0])) {
+        char c = (char)tolower((unsigned char)s[0]);
+        if (c != 'a' && c != 'i') {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/* ============================
  * PASS 1: tokenización básica
  * ============================ */
 
 static void tokenize_text_pass1(const char *text, Dict *dict, IntVec *stream) {
     char *norm = normalize_text(text);
+    if (!norm) return;
+
+    if (should_skip_line_norm(norm)) {
+        free(norm);
+        return;
+    }
+
     size_t len = strlen(norm);
     size_t i = 0;
     char wordBuf[512];
@@ -1623,3 +1711,4 @@ int main(void) {
 
     return 0;
 }
+
